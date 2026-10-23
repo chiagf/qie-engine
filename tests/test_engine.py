@@ -323,7 +323,10 @@ class TestRife(unittest.TestCase):
         self.assertEqual(middle.getpixel((0, 0)), (127, 127, 127))
 
     def test_blend_works_on_float_arrays(self):
-        import numpy as np
+        try:
+            import numpy as np
+        except ImportError:
+            self.skipTest("numpy not installed (CI runs the CPU suite torch- and numpy-free)")
 
         left = np.zeros((8, 8, 3), dtype="float32")
         right = np.ones((8, 8, 3), dtype="float32")
