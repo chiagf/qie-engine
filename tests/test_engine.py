@@ -418,5 +418,78 @@ class TestTree(unittest.TestCase):
         self.assertTrue((ROOT / "pyproject.toml").exists())
 
 
+class TestBootGuards(unittest.TestCase):
+    """The preflights that turn "process vanished mid-boot" into a readable boot error."""
+
+    def test_parse_meminfo_reads_total_and_available(self):
+        text = (
+            "MemTotal:       65536000 kB\n"
+            "MemFree:         1024000 kB\n"
+            "MemAvailable:   33554432 kB\n"
+            "SwapTotal:             0 kB\n"
+        )
+        total, available = runtime.parse_meminfo(text)
+        self.assertEqual(total, 62.5)
+        self.assertEqual(available, 32.0)
+
+    def test_parse_meminfo_falls_back_to_memfree(self):
+        total, available = runtime.parse_meminfo("MemTotal: 2097152 kB\nMemFree: 1048576 kB\n")
+        self.assertEqual(total, 2.0)
+        self.assertEqual(available, 1.0)
+
+    def test_parse_meminfo_missing_keys_are_zero(self):
+        self.assertEqual(runtime.parse_meminfo(""), (0.0, 0.0))
+        self.assertEqual(runtime.parse_meminfo("SwapTotal: 123 kB\n"), (0.0, 0.0))
+
+    def test_ram_preflight_passes_when_memory_is_unknown(self):
+        # Windows/macOS dev boxes and nvidia-only containers report (0, 0): never block there.
+        self.assertIsNone(runtime.ram_preflight("fp8", 0.0, 0.0))
+        self.assertIsNone(runtime.ram_preflight("bf16", 0.0, 0.0))
+
+    def test_ram_preflight_blocks_a_host_that_would_be_oom_killed(self):
+        message = runtime.ram_preflight("fp8", 64.0, 32.0)
+        self.assertIsNotNone(message)
+        self.assertIn("32", message)
+        self.assertIn("OOM killer", message)
+
+    def test_ram_preflight_thresholds(self):
+        self.assertIsNone(runtime.ram_preflight("fp8", 128.0, 96.0))
+        self.assertIsNone(runtime.ram_preflight("fp8", 64.0, 52.0))
+        self.assertIsNotNone(runtime.ram_preflight("fp8", 64.0, 51.0))
+        self.assertIsNone(runtime.ram_preflight("bf16", 128.0, 96.0))
+        self.assertIsNotNone(runtime.ram_preflight("bf16", 128.0, 79.0))
+
+    def test_load_thresholds_cover_both_resident_experts(self):
+        self.assertGreater(runtime.WAN_LOAD_RAM_FP8_GB, 2 * runtime.WAN_EXPERT_FP8_GB)
+        self.assertGreater(runtime.WAN_LOAD_RAM_BF16_GB, 2 * runtime.WAN_EXPERT_BF16_GB)
+
+    def test_disk_free_is_measurable_for_the_current_dir(self):
+        self.assertGreater(runtime.disk_free_gb("."), 0.0)
+
+    def test_disk_free_walks_up_to_an_existing_ancestor(self):
+        missing = str(pathlib.Path.cwd() / "no-such-dir" / "deeper")
+        self.assertGreater(runtime.disk_free_gb(missing), 0.0)
+
+    def test_disk_guard_raises_oserror_when_the_download_cannot_fit(self):
+        with self.assertRaises(OSError) as caught:
+            runtime.disk_guard(".", 10**9, "test download")
+        message = str(caught.exception)
+        self.assertIn("not enough disk for test download", message)
+        self.assertIn("GB", message)
+
+    def test_disk_guard_stays_silent_when_there_is_room(self):
+        runtime.disk_guard(".", 0.0001, "test download")
+        runtime.disk_guard("", 0.0001, "test download")
+
+    def test_pipeline_missing_is_false_for_an_existing_local_dir(self):
+        # A baked /models/pipeline dir must never trip the download guard.
+        self.assertFalse(wan._pipeline_missing(str(pathlib.Path.cwd())))
+
+    def test_pipeline_missing_is_true_for_a_repo_the_cache_does_not_have(self):
+        # Conservative: an uncached repo (or a box without huggingface_hub yet) means
+        # "might download", which is exactly what the guard protects.
+        self.assertTrue(wan._pipeline_missing("owner/definitely-never-cached-repo"))
+
+
 if __name__ == "__main__":
     unittest.main()

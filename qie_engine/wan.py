@@ -12,11 +12,21 @@ The engine depends only on `qie_engine.settings.WanSettings`; it never imports a
 from __future__ import annotations
 
 import os
+import threading
 import time
 from dataclasses import dataclass
 
 from qie_engine.rife import RifeInterpolator
-from qie_engine.runtime import choose_offload, gpu_info
+from qie_engine.runtime import (
+    WAN_DISK_DOWNLOAD_GB,
+    WAN_DISK_EXPERT_GB,
+    choose_offload,
+    disk_guard,
+    gpu_info,
+    host_memory,
+    ram_preflight,
+    rss_gb,
+)
 from qie_engine.settings import (
     MAX_SEED,
     MAX_STEPS,
@@ -65,6 +75,22 @@ def expert_fp8_ready(spec: str) -> bool:
         return True
     repo, subpath = wan_expert_file(spec)
     return bool(repo and subpath)
+
+
+def _pipeline_missing(spec: str) -> bool:
+    """True when the text-encoder/VAE half still has to come off the network.
+
+    An existing local path (baked image) counts as present; a repo id is asked of the HF
+    cache directly, so a warm second boot never trips the disk guard it would otherwise fail.
+    """
+    if os.path.exists(spec):
+        return False
+    try:
+        from huggingface_hub import try_to_load_from_cache
+
+        return try_to_load_from_cache(spec, "model_index.json") is None
+    except Exception:  # noqa: BLE001 - unknown means "might download", which is what we guard
+        return True
 
 
 def scheduler_names() -> tuple[str, ...]:
@@ -118,6 +144,8 @@ class WanEngine:
         self.lora = ""
         self.dtype = ""
         self.scheduler = ""
+        self._fp8_used = False
+        self._lock = threading.Lock()
         self.rife = RifeInterpolator(cache_dir=cfg.hf_home, enabled=cfg.rife_enabled)
 
     def _torch(self):
@@ -126,58 +154,86 @@ class WanEngine:
         return torch
 
     def load(self) -> str | None:
-        """Build the pipeline. Returns an error string instead of raising."""
+        """Build the pipeline. Returns an error string instead of raising.
+
+        Thread-safe and idempotent: apps call it from a background retry loop, so a stale
+        error from a failed attempt is cleared at the start of every new one.
+        """
         if self.loaded:
             return None
-        cfg = self.cfg
-        try:
-            torch = self._torch()
-            from diffusers import WanImageToVideoPipeline
+        with self._lock:
+            if self.loaded:
+                return None
+            self.error = ""
+            cfg = self.cfg
+            try:
+                torch = self._torch()
+                from diffusers import WanImageToVideoPipeline
 
-            total = gpu_info().get("total_gb", 0.0)
-            self.offload = choose_offload(cfg.offload or "auto", total)
-            self.dtype = cfg.dtype
+                total = gpu_info().get("total_gb", 0.0)
+                self.offload = choose_offload(cfg.offload or "auto", total)
+                self.dtype = cfg.dtype
+                # Refuse early with a readable message instead of letting the Linux OOM
+                # killer or ENOSPC terminate us hours into a download.
+                ram_problem = ram_preflight(cfg.dtype, *host_memory())
+                if ram_problem:
+                    raise RuntimeError(ram_problem)
+                if _pipeline_missing(cfg.pipeline):
+                    disk_guard(cfg.hf_home or ".", WAN_DISK_DOWNLOAD_GB, "the pipeline download")
 
-            high, low = self._experts(torch)
-            pipe = WanImageToVideoPipeline.from_pretrained(
-                cfg.pipeline,
-                transformer=high,
-                transformer_2=low,
-                torch_dtype=torch.bfloat16,
-            )
-            self.scheduler = apply_scheduler(pipe, cfg.default_scheduler, cfg.shift)
-            self._attention(pipe)
-            self._lora(pipe)
-            if cfg.dtype == "fp8":
-                self._requantize(pipe)
-            if self.offload in {"model", "sequential"}:
-                pipe.enable_model_cpu_offload()
-            else:
-                pipe.to("cuda")
-            self.pipe = pipe
-            self.loaded = True
-            return None
-        except Exception as error:  # noqa: BLE001 - the app shows this string, never a traceback
-            self.error = f"{type(error).__name__}: {error}"
-            return self.error
+                high, low = self._experts(torch)
+                if not self._fp8_used and cfg.dtype == "fp8":
+                    # The fallback ran: /status must not claim fp8 for bf16 weights.
+                    self.dtype = "bf16"
+                print(f"[wan] host RAM after experts: {rss_gb():.1f} GB rss", flush=True)
+                pipe = WanImageToVideoPipeline.from_pretrained(
+                    cfg.pipeline,
+                    transformer=high,
+                    transformer_2=low,
+                    torch_dtype=torch.bfloat16,
+                )
+                print(f"[wan] host RAM after pipeline: {rss_gb():.1f} GB rss", flush=True)
+                self.scheduler = apply_scheduler(pipe, cfg.default_scheduler, cfg.shift)
+                self._attention(pipe)
+                self._lora(pipe)
+                if cfg.dtype == "fp8":
+                    self._requantize(pipe)
+                if self.offload in {"model", "sequential"}:
+                    pipe.enable_model_cpu_offload()
+                else:
+                    pipe.to("cuda")
+                self.pipe = pipe
+                self.loaded = True
+                return None
+            except Exception as error:  # noqa: BLE001 - the app shows this string, never a traceback
+                self.error = f"{type(error).__name__}: {error}"
+                return self.error
 
     def _experts(self, torch):
         """fp8 single-file pair first (baked path or `subpath@repo`); bf16 repos as fallback."""
         from diffusers.models import WanTransformer3DModel
 
         cfg = self.cfg
+        self._fp8_used = False
         high_spec, low_spec = str(cfg.expert_high), str(cfg.expert_low)
         fp8_specs = cfg.dtype == "fp8" and (
             expert_fp8_ready(high_spec) and expert_fp8_ready(low_spec)
         )
         if fp8_specs:
             try:
-                return (
+                experts = (
                     WanTransformer3DModel.from_single_file(self._local(high_spec)),
                     WanTransformer3DModel.from_single_file(self._local(low_spec)),
                 )
+            except OSError:
+                # Disk full or network gone: the bf16 fallback re-downloads ~56 GB and would
+                # die the same way. Surface the real error instead of compounding the wait.
+                raise
             except Exception as error:  # noqa: BLE001 - old diffusers or unsupported format
                 print(f"[wan] fp8 single-file experts failed ({error}); using bf16 + torchao")
+            else:
+                self._fp8_used = True
+                return experts
         return (
             WanTransformer3DModel.from_pretrained(
                 cfg.transformer_repo, subfolder="transformer", dtype=torch.bfloat16
@@ -192,6 +248,7 @@ class WanEngine:
         if os.path.exists(spec):
             return spec
         repo, subpath = wan_expert_file(spec)
+        disk_guard(self.cfg.hf_home or ".", WAN_DISK_EXPERT_GB, f"expert {repo}:{subpath}")
         from huggingface_hub import hf_hub_download
 
         return hf_hub_download(repo_id=repo, filename=subpath.strip("/"))
@@ -291,7 +348,7 @@ class WanEngine:
         out_dir: str = ".",
     ) -> VideoResult:
         if not self.loaded:
-            raise RuntimeError(self.error or "video model not loaded")
+            raise RuntimeError(self.error or "video model not loaded (still loading, or preload is off)")
         torch = self._torch()
         cfg = self.cfg
         from PIL import Image
