@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Test / tooling
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Weights and renders - never commit these.
+models/
+*.safetensors
+*.ckpt
+*.pkl
+*.pt
+*.pth
+out/
+data/
+hf/
+rife/
+
+# Local scratch
+*.mp4
+*.log
+.DS_Store
+Thumbs.db

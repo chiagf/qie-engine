@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qie-engine"
+version = "0.1.0"
+description = "Portable Wan2.2 I2V engine (first/last frame to mp4) shared by the qie apps."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+
+# Deliberately empty of heavy deps: torch, diffusers, transformers and huggingface_hub are
+# imported lazily inside the methods that need them, so the CPU test suite and any app that
+# already pins its own stack can consume this package without a resolver fight.
+dependencies = []
+
+[project.optional-dependencies]
+# Everything the engine actually uses at render time.
+runtime = [
+    "torch",
+    "diffusers>=0.41.0",
+    "transformers>=4.57",
+    "accelerate",
+    "peft",
+    "safetensors",
+    "sentencepiece",
+    "torchvision",
+    "huggingface_hub",
+    "hf_xet",
+    "pillow",
+    "numpy",
+]
+
+[tool.setuptools.packages.find]
+include = ["qie_engine*"]
+
+[tool.setuptools.package-data]
+# The RIFE support code is imported by name from a path we insert at runtime.
+qie_engine = ["_rife_support/model/*.py"]
